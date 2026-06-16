@@ -185,13 +185,14 @@ def _agent_call_with_tools(
     agent: AgentState, task_content: str, extra_context: str, workspace_id: str
 ) -> str:
     """Tool-loop: модель просит инструменты, хост их исполняет и возвращает результат."""
-    from modules.agent_tools import ensure_workspace, execute_tool, TOOL_SPECS
+    from modules.agent_tools import ensure_workspace, execute_tool, get_tool_specs
 
-    workspace = ensure_workspace(workspace_id)
-    system    = _build_agent_system(agent, extra_context, workspace=str(workspace))
-    client    = _get_openai_client()
-    model     = cfg_module.CFG.model
-    max_iters = getattr(cfg_module.CFG, "agent_tool_max_iters", 12)
+    workspace  = ensure_workspace(workspace_id)
+    system     = _build_agent_system(agent, extra_context, workspace=str(workspace))
+    client     = _get_openai_client()
+    model      = cfg_module.CFG.model
+    max_iters  = getattr(cfg_module.CFG, "agent_tool_max_iters", 12)
+    tool_specs = get_tool_specs()
 
     messages: list[dict] = [
         {"role": "system", "content": system},
@@ -200,7 +201,7 @@ def _agent_call_with_tools(
 
     for _ in range(max_iters):
         resp = client.chat.completions.create(
-            model=model, messages=messages, tools=TOOL_SPECS, max_tokens=4096,
+            model=model, messages=messages, tools=tool_specs, max_tokens=4096,
         )
         msg = resp.choices[0].message
         tool_calls = msg.tool_calls or []
@@ -242,11 +243,26 @@ def _build_agent_system(agent: AgentState, extra_context: str = "",
     if extra_context:
         parts.append(f"Дополнительный контекст: {extra_context}")
     if workspace:
-        parts.append(
-            "У тебя есть ИНСТРУМЕНТЫ — вызывай их, а не описывай словами:\n"
+        shell_on = getattr(cfg_module.CFG, "enable_shell_tool", False)
+        tool_lines = (
             "  • http_fetch(url) — скачать реальные данные из интернета;\n"
             "  • write_file(path, content), read_file(path), list_files() —\n"
-            f"    файлы в твоём рабочем каталоге проекта: {workspace}\n"
+            f"    файлы в твоём рабочем каталоге проекта: {workspace}"
+        )
+        if shell_on:
+            tool_lines += (
+                "\n  • run_shell(command) — выполнить команду в каталоге проекта "
+                "(pip install, запуск кода, pytest)."
+            )
+        verify_line = (
+            "\nПРОВЕРЯЙ СЕБЯ: после написания кода ЗАПУСТИ его и прогони тесты через "
+            "run_shell, прочитай ошибки и ИСПРАВЬ их — заканчивай только когда код "
+            "реально работает (exit_code=0)."
+            if shell_on else ""
+        )
+        parts.append(
+            "У тебя есть ИНСТРУМЕНТЫ — вызывай их, а не описывай словами:\n"
+            + tool_lines + "\n"
             "Делай задачу ПО-НАСТОЯЩЕМУ: если нужны данные/структура страницы — "
             "СКАЧАЙ через http_fetch (не выдумывай). Если нужен код/конфиги/Docker — "
             "СОЗДАЙ реальные файлы через write_file.\n"
@@ -254,7 +270,8 @@ def _build_agent_system(agent: AgentState, extra_context: str = "",
             "(парсер, БД, REST API, графики, Telegram-уведомления, Docker/systemd) — "
             "создай ВСЕ как реальные файлы. НЕ откладывай ничего в «следующие шаги»/"
             "«TODO»/«предлагается доработать» — отложенное считается НЕВЫПОЛНЕННЫМ. "
-            "Не заканчивай, пока все требуемые части не созданы и не связаны.\n"
+            "Не заканчивай, пока все требуемые части не созданы и не связаны."
+            + verify_line + "\n"
             "В финальном 'result' кратко опиши, что сделал, и перечисли созданные "
             "файлы (через list_files)."
         )

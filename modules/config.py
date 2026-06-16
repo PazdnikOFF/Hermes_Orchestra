@@ -72,6 +72,11 @@ class OrchestraConfig:
     # Агент через function-calling Grok'а реально фетчит URL и пишет файлы
     # проекта в изолированный workspace. Выключить → ORCHESTRA_AGENT_TOOLS=0.
     enable_agent_tools: bool = True
+    # run_shell: агент сам запускает код/тесты для самопроверки. ВНИМАНИЕ:
+    # это исполнение LLM-команд под пользователем оркестра (не песочница) —
+    # есть denylist катастрофических команд, но не полная изоляция.
+    # Выключить → ORCHESTRA_SHELL_TOOL=0.
+    enable_shell_tool: bool = True
     agent_workspace_dir: str = "~/.hermes/orchestra_workspaces"
     # макс. циклов tool-call на один вызов агента. Многокомпонентная система
     # (парсер+БД+API+бот+Docker) требует много write_file → 40, иначе агент
@@ -138,6 +143,7 @@ def load_config() -> OrchestraConfig:
         embedding_model=env_or("ORCHESTRA_EMBEDDING_MODEL", defaults.embedding_model),
         use_embeddings=os.environ.get("ORCHESTRA_USE_EMBEDDINGS", "0") == "1",
         enable_agent_tools=os.environ.get("ORCHESTRA_AGENT_TOOLS", "1") == "1",
+        enable_shell_tool=os.environ.get("ORCHESTRA_SHELL_TOOL", "1") == "1",
         agent_workspace_dir=env_or("ORCHESTRA_WORKSPACE_DIR", defaults.agent_workspace_dir),
         agent_tool_max_iters=int(os.environ.get("ORCHESTRA_AGENT_TOOL_ITERS",
                                                 str(defaults.agent_tool_max_iters))),
@@ -157,3 +163,12 @@ def load_config() -> OrchestraConfig:
 # Глобальный singleton — загружается один раз при импорте
 # Для тестов можно подменить: config.CFG = OrchestraConfig(...)
 CFG: OrchestraConfig = load_config()
+
+
+# ── Глушим болтливые сторонние логгеры ─────────────────────────────────────
+# httpx логирует КАЖДЫЙ LLM-запрос на INFO ("HTTP Request: POST … 200 OK").
+# С tool-loop'ом (до 40 вызовов на агента) это заваливает консоль. Оставляем
+# только WARNING+. Импортируется всеми процессами оркестра, поэтому централизованно.
+import logging as _logging
+for _noisy in ("httpx", "httpcore", "openai", "urllib3", "asyncio"):
+    _logging.getLogger(_noisy).setLevel(_logging.WARNING)

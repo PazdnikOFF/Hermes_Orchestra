@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import socket
+import subprocess
 from pathlib import Path
 from urllib import request as urlreq
 from urllib.parse import urlparse
@@ -34,6 +35,19 @@ HTTP_READ_BYTES   = 300_000     # сколько байт читаем
 HTTP_RETURN_CHARS = 40_000      # сколько символов отдаём модели (контекст)
 MAX_FILE_BYTES    = 1_000_000   # лимит на write_file
 MAX_LIST_FILES    = 500
+
+SHELL_TIMEOUT       = 180        # сек на команду
+SHELL_OUTPUT_CHARS  = 20_000     # сколько вывода отдаём модели
+# Denylist катастрофических команд. НЕ полноценная песочница — лишь отсев
+# самого опасного. Команды всё равно исполняются под пользователем оркестра.
+_SHELL_DENY = [
+    r"rm\s+-rf?\s+(/|~|\$HOME|\*)\s*$", r"rm\s+-rf?\s+(/|~)\s",
+    r"\bmkfs\b", r"\bdd\s+if=", r">\s*/dev/sd", r"\bshutdown\b",
+    r"\breboot\b", r"\bhalt\b", r"\bpoweroff\b", r":\(\)\s*\{.*\|.*&.*\}",
+    r"\bchmod\s+-R\s+777\s+/", r"\bchown\s+-R\b.*\s/\s*$",
+    r"curl[^|]*\|\s*(sudo\s+)?(ba)?sh", r"wget[^|]*\|\s*(sudo\s+)?(ba)?sh",
+    r"\bsudo\b", r"\bsystemctl\b", r"\bcrontab\b", r">\s*/etc/",
+]
 
 
 # ── OpenAI-совместимые схемы инструментов ──────────────────────────────────
@@ -66,6 +80,24 @@ TOOL_SPECS = [
         "description": "Список всех файлов в рабочем каталоге проекта.",
         "parameters": {"type": "object", "properties": {}}}},
 ]
+
+SHELL_TOOL_SPEC = {"type": "function", "function": {
+    "name": "run_shell",
+    "description": ("Выполнить shell-команду В рабочем каталоге проекта (cwd=workspace). "
+                    "Используй чтобы ПРОВЕРИТЬ СЕБЯ: поставить зависимости (pip install), "
+                    "ЗАПУСТИТЬ код, прогнать тесты (pytest), собрать. Возвращает exit-код "
+                    f"и вывод. Таймаут {SHELL_TIMEOUT}с."),
+    "parameters": {"type": "object", "properties": {
+        "command": {"type": "string"}}, "required": ["command"]}}}
+
+
+def get_tool_specs() -> list:
+    """Список инструментов с учётом флага shell (run_shell — опционально)."""
+    from modules.config import CFG
+    specs = list(TOOL_SPECS)
+    if getattr(CFG, "enable_shell_tool", False):
+        specs.append(SHELL_TOOL_SPEC)
+    return specs
 
 
 # ── Чистые helper'ы (тестируемые) ──────────────────────────────────────────
@@ -191,6 +223,34 @@ def _list_files(workspace: Path) -> str:
     return "\n".join(sorted(out)) if out else "(пусто)"
 
 
+def _run_shell(workspace: Path, command: str) -> str:
+    from modules.config import CFG
+    if not getattr(CFG, "enable_shell_tool", False):
+        return "ERROR: run_shell отключён (ORCHESTRA_SHELL_TOOL=0)"
+    command = (command or "").strip()
+    if not command:
+        return "ERROR: пустая команда"
+    for pat in _SHELL_DENY:
+        if re.search(pat, command, flags=re.IGNORECASE):
+            log.warning("[run_shell] отклонено политикой: %s", command[:120])
+            return f"ERROR: команда отклонена политикой безопасности (паттерн: {pat})"
+    try:
+        proc = subprocess.run(
+            command, shell=True, cwd=str(workspace),
+            capture_output=True, text=True, timeout=SHELL_TIMEOUT,
+        )
+        out = proc.stdout or ""
+        if proc.stderr:
+            out += "\n[stderr]\n" + proc.stderr
+        if len(out) > SHELL_OUTPUT_CHARS:
+            out = out[:SHELL_OUTPUT_CHARS] + "\n…[truncated]"
+        return f"exit_code={proc.returncode}\n{out}"
+    except subprocess.TimeoutExpired:
+        return f"ERROR: команда превысила таймаут {SHELL_TIMEOUT}с"
+    except Exception as exc:
+        return f"ERROR: run_shell failed: {exc}"
+
+
 def execute_tool(name: str, args: dict, workspace: Path) -> str:
     """Диспетчер. Любая ошибка возвращается строкой ERROR — не роняет агента."""
     try:
@@ -202,6 +262,8 @@ def execute_tool(name: str, args: dict, workspace: Path) -> str:
             return _read_file(workspace, args.get("path", ""))
         if name == "list_files":
             return _list_files(workspace)
+        if name == "run_shell":
+            return _run_shell(workspace, args.get("command", ""))
         return f"ERROR: неизвестный инструмент {name}"
     except Exception as exc:
         return f"ERROR: {exc}"
