@@ -248,6 +248,13 @@ class ResultAssembler:
         log.info("[Assembler] %s — final_result сохранён (%d симв., quality=%s)",
                  parent_task_id, len(final), quality)
 
+        # Чистим DAG-состояние (итерация 7), если задача шла через граф зависимостей.
+        try:
+            get_redis().delete(f"dag:{parent_task_id}:plan",
+                               f"dag:{parent_task_id}:published")
+        except Exception:
+            pass
+
         # Освобождаем direction'ы и убиваем агентов если ни одна задача
         # их больше не использует. Эволюция душ/скиллов уже прошла
         # per-subtask в JudgeWorker — здесь только teardown.

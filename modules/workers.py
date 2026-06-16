@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Optional
 from modules.models import AgentRole, AgentState, Task, TaskStatus, make_agent_id
 from modules.redis_bus import (
     AgentRegistry, STREAM_SENIOR, STREAM_JUDGE_IN,
-    ack_task, publish_task, read_tasks, save_result,
+    ack_task, publish_task, read_tasks, save_result, load_result,
     stream_agent, stream_middle, get_redis,
 )
 from modules.llm_bridge import (
@@ -158,6 +158,145 @@ def _spawn_worker_subprocess(kind: str, worker_id: str, direction: str = "") -> 
     return proc.pid
 
 
+# ── DAG: граф зависимостей направлений (итерация 7) ─────────────────────────
+# Senior может выдать план с depends_on. Корни публикуются сразу, остальные —
+# по мере завершения предков (dag_advance из Judge/Watchdog), с пробросом
+# результатов предков в контекст. Публикация идемпотентна (SADD-гейт).
+
+DAG_PLAN_KEY       = "dag:{}:plan"
+DAG_PUBLISHED_KEY  = "dag:{}:published"
+DAG_PENDING_SUFFIX = "_PENDING"
+DAG_PLAN_TTL       = 86400          # сутки — страховка от утечки ключей
+_DAG_TERMINAL      = {"done", "dlq", "failed", "partial_dlq"}
+
+
+def _dag_placeholder(parent_id: str, direction: str) -> str:
+    """Псевдо-id направления в decomposition до его публикации.
+    Никогда не терминален → держит ResultAssembler от ранней сборки."""
+    return f"{parent_id}_{direction}{DAG_PENDING_SUFFIX}"
+
+
+def _dag_direction_done(r, ids: list[str]) -> bool:
+    """Направление завершено: есть реальные id (не placeholder) и все терминальны."""
+    if not ids or any(sid.endswith(DAG_PENDING_SUFFIX) for sid in ids):
+        return False
+    return all(r.hget(f"results:{sid}", "status") in _DAG_TERMINAL for sid in ids)
+
+
+def _dag_gather_upstream(r, decomp: dict, deps: list[str]) -> str:
+    """Собирает результаты направлений-предков для проброса в контекст потомка."""
+    parts = []
+    for dep in deps:
+        for sid in decomp.get(dep, []):
+            if sid.endswith(DAG_PENDING_SUFFIX):
+                continue
+            res = r.hget(f"results:{sid}", "result")
+            if res:
+                parts.append(f"### {dep}\n{res}")
+    return "\n\n".join(parts)
+
+
+def _dag_replace_placeholder(parent_id: str, direction: str, real_ids: list[str]) -> None:
+    """Атомарно заменяет placeholder направления в decomposition на реальные id."""
+    r = get_redis()
+    key = f"results:{parent_id}"
+    for _ in range(5):
+        with r.pipeline() as pipe:
+            try:
+                pipe.watch(key)
+                raw = pipe.hget(key, "decomposition")
+                decomp = json.loads(raw) if raw else {}
+                decomp[direction] = real_ids
+                pipe.multi()
+                pipe.hset(key, "decomposition", json.dumps(decomp))
+                pipe.execute()
+                return
+            except Exception:
+                continue
+
+
+def _dag_publish_direction(parent_id, plan, direction, factory, source_id,
+                           retry_max=3):
+    """
+    Публикует одно направление (идемпотентно через SADD). Подмешивает
+    результаты направлений-предков в контекст подзадачи.
+
+    ВАЖНО: сначала заменяем placeholder на реальные id в decomposition,
+    и ТОЛЬКО потом публикуем в Middle — иначе MiddleWorker._patch_parent_
+    decomposition не найдёт id для замены на mt-айдишники (риск зависания).
+    """
+    r = get_redis()
+    # exactly-once: публикует лишь тот, кто первым добавил направление в set
+    if not r.sadd(DAG_PUBLISHED_KEY.format(parent_id), direction):
+        return
+    spec = next((s for s in plan if s["direction"] == direction), None)
+    if not spec:
+        return
+
+    subtask = spec.get("subtask") or load_result(parent_id).get("original_task", "")
+    count   = int(spec.get("count", 1) or 1)
+    deps    = spec.get("depends_on", [])
+
+    content = subtask
+    if deps:
+        try:
+            decomp = json.loads(load_result(parent_id).get("decomposition", "{}"))
+        except Exception:
+            decomp = {}
+        ctx = _dag_gather_upstream(r, decomp, deps)
+        if ctx:
+            content = (
+                subtask
+                + "\n\n--- Результаты предыдущих направлений (используй как исходные данные) ---\n"
+                + ctx
+            )
+
+    from modules.agent_lifecycle import acquire_direction
+    acquire_direction(parent_id, direction)
+    middle = factory.create_middle(direction)
+    _ensure_worker_running("middle", direction, middle.id)
+
+    real_ids = [f"{parent_id}_{direction}_{uuid.uuid4().hex[:6]}" for _ in range(count)]
+    _dag_replace_placeholder(parent_id, direction, real_ids)
+    for sid in real_ids:
+        sub = Task(
+            id=sid, content=content, direction=direction,
+            source_agent_id=source_id, retry_max=retry_max,
+            parent_task_id=parent_id,
+        )
+        publish_task(stream_middle(direction), sub)
+        log.info("[DAG] %s → Middle/%s: %s (deps=%s)", parent_id, direction, sid, deps)
+
+
+def dag_advance(parent_id, factory, source_id="judge-dag"):
+    """
+    Вызывается после завершения сабтаска: публикует направления, чьи
+    зависимости теперь выполнены. Идемпотентно, без блокировок (гейт — SADD).
+    Для не-DAG задач (нет ключа dag:*:plan) — no-op.
+    """
+    if not parent_id:
+        return
+    r = get_redis()
+    plan_raw = r.get(DAG_PLAN_KEY.format(parent_id))
+    if not plan_raw:
+        return
+    try:
+        plan = json.loads(plan_raw)
+        decomp = json.loads(load_result(parent_id).get("decomposition", "{}"))
+    except Exception:
+        return
+
+    done = {d for d, ids in decomp.items() if _dag_direction_done(r, ids)}
+    published = set(r.smembers(DAG_PUBLISHED_KEY.format(parent_id)))
+
+    from modules.dag import ready_directions
+    for d in ready_directions(plan, done, published):
+        try:
+            _dag_publish_direction(parent_id, plan, d, factory, source_id)
+        except Exception as exc:
+            log.exception("[DAG] publish %s/%s failed: %s", parent_id, d, exc)
+
+
 # ── Base ──────────────────────────────────────────────────────────────────
 
 class BaseWorker:
@@ -252,11 +391,22 @@ class SeniorWorker(BaseWorker):
                      task.id)
             return
 
+        # ── Граф зависимостей (итерация 7) или плоский параллельный режим ──
+        from modules.dag import normalize_plan, has_dependencies, is_acyclic
+        plan = normalize_plan(covered_plan)
+        if has_dependencies(plan):
+            if is_acyclic(plan):
+                self._handle_dag(task, plan, bool(gap_requests))
+                return
+            log.warning("[Senior] %s: план с зависимостями содержит цикл — "
+                        "fallback на параллельный режим", task.id)
+
+        # Плоский режим: все направления стартуют параллельно (как раньше).
         subtask_map: dict[str, list[str]] = {}
-        for spec in covered_plan:
-            direction = spec.get("direction", "researcher")
-            subtask   = spec.get("subtask", task.content)
-            count     = int(spec.get("count", 1))
+        for spec in plan:
+            direction = spec["direction"]
+            subtask   = spec["subtask"] or task.content
+            count     = spec["count"]
 
             # Refcount: задача "арендует" direction; ResultAssembler
             # после финала отпускает и убивает агентов когда refcount=0.
@@ -283,6 +433,32 @@ class SeniorWorker(BaseWorker):
         save_result(task.id, "original_task",  task.content)
         save_result(task.id, "status",
                     "partial" if gap_requests else "decomposed")
+
+    def _handle_dag(self, task: Task, plan: list[dict], partial: bool) -> None:
+        """
+        Запуск задачи в режиме графа зависимостей.
+        decomposition заполняется placeholder'ами для ВСЕХ направлений (чтобы
+        ResultAssembler ждал их все), публикуются только корни (без depends_on).
+        Остальные направления освобождает dag_advance по мере готовности предков.
+        """
+        from modules.dag import ready_directions
+
+        decomp = {s["direction"]: [_dag_placeholder(task.id, s["direction"])]
+                  for s in plan}
+        save_result(task.id, "decomposition", json.dumps(decomp))
+        save_result(task.id, "original_task", task.content)
+        save_result(task.id, "status", "partial" if partial else "decomposed")
+
+        r = get_redis()
+        r.set(DAG_PLAN_KEY.format(task.id), json.dumps(plan), ex=DAG_PLAN_TTL)
+        r.delete(DAG_PUBLISHED_KEY.format(task.id))
+
+        roots = ready_directions(plan, done_dirs=set(), published_dirs=set())
+        log.info("[Senior] %s DAG-режим: %d направлений, корни=%s",
+                 task.id, len(plan), roots)
+        for d in roots:
+            _dag_publish_direction(task.id, plan, d, self.factory,
+                                   self.worker_id, retry_max=task.retry_max)
 
 
 # ── Middle ────────────────────────────────────────────────────────────────
@@ -686,6 +862,13 @@ class JudgeWorker(BaseWorker):
             if evolved:
                 log.info("[Judge] душа агента %s улучшена", agent.direction)
 
+        # ── DAG: публикуем направления, чьи зависимости теперь выполнены ──
+        try:
+            dag_advance(task.parent_task_id, self.factory)
+        except Exception as exc:
+            log.exception("[Judge] DAG advance error %s: %s",
+                          task.parent_task_id, exc)
+
         # ── Авто-сборка финала ────────────────────────────────────────────
         try:
             if self.result_assembler.maybe_assemble(task.parent_task_id):
@@ -788,12 +971,25 @@ class WatchdogWorker(BaseWorker):
         while not self._stop:
             try:
                 self._tick()
+                self._dag_tick()
                 reassigned = watcher.check_all()
                 if reassigned:
                     log.info("[Watchdog] переназначено задач: %d", reassigned)
             except Exception as exc:
                 log.exception("[Watchdog] ошибка тика: %s", exc)
             time.sleep(interval)
+
+    def _dag_tick(self):
+        """Страховка для DAG: периодически двигаем графы вперёд. Закрывает
+        случай, когда направление-предок ушло в DLQ без Judge-события — тогда
+        потомки не разблокировались бы по обычному хуку из JudgeWorker."""
+        r = get_redis()
+        for key in r.scan_iter(match="dag:*:plan", count=100):
+            parent_id = key.split(":")[1]
+            try:
+                dag_advance(parent_id, self.factory)
+            except Exception:
+                pass
 
     def _tick(self):
         from modules.redis_bus import get_redis
