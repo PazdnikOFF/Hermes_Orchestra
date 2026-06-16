@@ -774,7 +774,17 @@ class JudgeWorker(BaseWorker):
         agent       = AgentRegistry.load(task.source_agent_id)
         soul_prompt = agent.soul.to_prompt() if agent else "(unknown)"
 
-        verdict = judge_evaluate(task.direction, task.content, task.result or "", soul_prompt)
+        # Сверка с реальными артефактами: Judge видит фактический список файлов
+        # проекта и может зарубить неполноту (заявлено больше, чем создано).
+        artifacts = ""
+        try:
+            from modules.agent_tools import peek_workspace
+            artifacts = peek_workspace(task.parent_task_id or task.id)
+        except Exception:
+            pass
+
+        verdict = judge_evaluate(task.direction, task.content, task.result or "",
+                                 soul_prompt, artifacts=artifacts)
         score   = float(verdict.get("score", 0.0))
         crit_llm = verdict.get("critique", "")
 

@@ -125,6 +125,17 @@ def ensure_workspace(task_id: str) -> Path:
     return ws
 
 
+def peek_workspace(task_id: str) -> str:
+    """Список файлов workspace БЕЗ создания папки — для Judge-верификации.
+    Возвращает '' если workspace ещё нет."""
+    from modules.config import CFG
+    base = Path(os.path.expanduser(CFG.agent_workspace_dir))
+    ws = base / _safe_component(task_id)
+    if not ws.exists():
+        return ""
+    return _list_files(ws)
+
+
 # ── Реализация инструментов ─────────────────────────────────────────────────
 
 def _http_fetch(url: str) -> str:

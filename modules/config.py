@@ -73,7 +73,10 @@ class OrchestraConfig:
     # проекта в изолированный workspace. Выключить → ORCHESTRA_AGENT_TOOLS=0.
     enable_agent_tools: bool = True
     agent_workspace_dir: str = "~/.hermes/orchestra_workspaces"
-    agent_tool_max_iters: int = 12   # макс. циклов tool-call на один вызов агента
+    # макс. циклов tool-call на один вызов агента. Многокомпонентная система
+    # (парсер+БД+API+бот+Docker) требует много write_file → 40, иначе агент
+    # упирается в лимит и спихивает остаток в «следующие шаги».
+    agent_tool_max_iters: int = 40
 
     # ── Пути ──────────────────────────────────────────────────────────────
     # Корень пакета (папка, в которой лежит modules/)
