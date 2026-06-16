@@ -49,6 +49,30 @@ log = logging.getLogger("orchestra.result_assembler")
 ASSEMBLE_LOCK_TTL = 10  # секунд
 TERMINAL_STATUSES = {"done", "dlq", "failed"}
 
+# Пороги качества для финальной сборки (итерация 6).
+#   < HARD_EXCLUDE → результат считаем непригодным (off-topic/мусор), НЕ включаем в финал
+#   < SOFT_REVIEW  → включаем, но помечаем quality=needs_review + баннер
+SCORE_HARD_EXCLUDE = 0.3
+SCORE_SOFT_REVIEW  = 0.5
+
+
+def _safe_float(v) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _finalized_as(sub: dict) -> str:
+    """Достаёт verdict.finalized_as ('passed'|'best_of'|'exhausted') из сабтаска."""
+    raw = sub.get("verdict")
+    if not raw:
+        return ""
+    try:
+        return json.loads(raw).get("finalized_as", "")
+    except Exception:
+        return ""
+
 
 class ResultAssembler:
     """Собирает финальный результат когда все сабтаски готовы."""
@@ -141,27 +165,52 @@ class ResultAssembler:
 
         original = parent_data.get("original_task", "")
 
-        # Группируем результаты по direction
+        # Группируем результаты по direction с гейтингом по качеству.
         direction_results: dict[str, list[str]] = {}
         had_dlq = False
+        review_flags: list[str] = []   # причины пометить финал needs_review
         for direction, ids in decomposition.items():
             collected = []
             for sid in ids:
                 sub = subtask_results.get(sid, {})
-                if sub.get("status") == "dlq":
+                st = sub.get("status")
+                if st == "dlq":
                     had_dlq = True
+                    review_flags.append(
+                        f"{direction}: подзадача в DLQ ({(sub.get('last_error') or '')[:80]})")
                     collected.append(f"[DLQ] {sub.get('last_error','')}")
-                elif sub.get("result"):
-                    collected.append(sub["result"])
+                    continue
+                result_text = sub.get("result")
+                if not result_text:
+                    review_flags.append(f"{direction}: нет результата")
+                    continue
+                score = _safe_float(sub.get("score"))
+                fin   = _finalized_as(sub)
+                # Жёсткий реджект: явный мусор/off-topic — не тащим в финал
+                if score is not None and score < SCORE_HARD_EXCLUDE:
+                    review_flags.append(
+                        f"{direction}: результат отклонён как недостоверный/не по теме "
+                        f"(score={score:.2f}) — исключён из сборки")
+                    continue
+                # Мягкий флаг: низкая уверенность — включаем, но помечаем
+                if fin in ("best_of", "exhausted") or (score is not None and score < SCORE_SOFT_REVIEW):
+                    score_s = f"{score:.2f}" if score is not None else "n/a"
+                    review_flags.append(
+                        f"{direction}: низкая уверенность (score={score_s}, {fin or 'n/a'})")
+                collected.append(result_text)
             if collected:
                 direction_results[direction] = collected
 
         if not direction_results:
-            log.warning("[Assembler] %s: нет полезных результатов для сборки",
+            log.warning("[Assembler] %s: нет пригодных результатов для сборки",
                         parent_task_id)
             save_result(parent_task_id, "status", "failed")
-            save_result(parent_task_id, "final_result",
-                        "Все сабтаски завершились без полезных результатов.")
+            save_result(parent_task_id, "quality", "needs_review")
+            note = "Все сабтаски завершились без пригодных результатов."
+            if review_flags:
+                note += "\nПричины:\n" + "\n".join(f"  • {f}" for f in review_flags)
+                save_result(parent_task_id, "quality_note", "; ".join(review_flags))
+            save_result(parent_task_id, "final_result", note)
             return True
 
         # Шорткат: если суммарно ровно один полезный результат и нет DLQ —
@@ -181,11 +230,23 @@ class ResultAssembler:
                 log.exception("[Assembler] ошибка сборки %s: %s", parent_task_id, exc)
                 return False
 
+        # Качество финала: если что-то отклонено/low-confidence/dlq — needs_review.
+        quality = "needs_review" if (review_flags or had_dlq) else "clean"
+        if review_flags:
+            banner = (
+                "⚠ КАЧЕСТВО: требуется проверка человеком.\n"
+                + "\n".join(f"  • {f}" for f in review_flags)
+                + "\n" + "─" * 50 + "\n\n"
+            )
+            final = banner + final
+            save_result(parent_task_id, "quality_note", "; ".join(review_flags))
+        save_result(parent_task_id, "quality", quality)
+
         save_result(parent_task_id, "final_result", final)
         save_result(parent_task_id, "assembled_at", str(time.time()))
         save_result(parent_task_id, "status", "done" if not had_dlq else "partial_dlq")
-        log.info("[Assembler] %s — final_result сохранён (%d симв.)",
-                 parent_task_id, len(final))
+        log.info("[Assembler] %s — final_result сохранён (%d симв., quality=%s)",
+                 parent_task_id, len(final), quality)
 
         # Освобождаем direction'ы и убиваем агентов если ни одна задача
         # их больше не использует. Эволюция душ/скиллов уже прошла
