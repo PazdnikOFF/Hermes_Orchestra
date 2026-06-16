@@ -149,27 +149,111 @@ def _call_anthropic(system: str, messages: list[dict], model: str, max_tokens: i
 
 # ── Агентские вызовы ──────────────────────────────────────────────────────
 
-def agent_call(agent: AgentState, task_content: str, extra_context: str = "") -> str:
+def agent_call(
+    agent: AgentState,
+    task_content: str,
+    extra_context: str = "",
+    workspace_id: Optional[str] = None,
+) -> str:
     """
     Выполняет задачу через агента. Инжектирует soul+skill в system prompt.
     Возвращает сырой текст ответа LLM.
+
+    Если включены инструменты (CFG.enable_agent_tools) и модель openai-совместимая
+    (Grok) — запускается tool-loop: агент реально фетчит URL и пишет файлы проекта
+    в workspace задачи. При любом сбое — graceful fallback на обычную генерацию.
     """
+    c = cfg_module.CFG
+    use_tools = (
+        getattr(c, "enable_agent_tools", True)
+        and not (c.model or "").startswith("claude")   # tool-loop реализован для Grok/openai-compat
+        and bool(workspace_id)
+    )
+    log.info("[%s/%s] вызов LLM%s (%.60s…)",
+             agent.direction, agent.id, " +tools" if use_tools else "", task_content)
+    if use_tools:
+        try:
+            return _agent_call_with_tools(agent, task_content, extra_context, workspace_id)
+        except Exception as exc:
+            log.warning("[%s] tool-loop сбой (%s) → fallback на текст", agent.id, exc)
+
     system = _build_agent_system(agent, extra_context)
-    messages = [{"role": "user", "content": task_content}]
-    log.info("[%s/%s] вызов LLM (%.60s…)", agent.direction, agent.id, task_content)
-    return call_llm(system, messages)
+    return call_llm(system, [{"role": "user", "content": task_content}])
 
 
-def _build_agent_system(agent: AgentState, extra_context: str = "") -> str:
-    """Собирает system prompt: soul + skill + инструкции по формату вывода."""
+def _agent_call_with_tools(
+    agent: AgentState, task_content: str, extra_context: str, workspace_id: str
+) -> str:
+    """Tool-loop: модель просит инструменты, хост их исполняет и возвращает результат."""
+    from modules.agent_tools import ensure_workspace, execute_tool, TOOL_SPECS
+
+    workspace = ensure_workspace(workspace_id)
+    system    = _build_agent_system(agent, extra_context, workspace=str(workspace))
+    client    = _get_openai_client()
+    model     = cfg_module.CFG.model
+    max_iters = getattr(cfg_module.CFG, "agent_tool_max_iters", 12)
+
+    messages: list[dict] = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": task_content},
+    ]
+
+    for _ in range(max_iters):
+        resp = client.chat.completions.create(
+            model=model, messages=messages, tools=TOOL_SPECS, max_tokens=4096,
+        )
+        msg = resp.choices[0].message
+        tool_calls = msg.tool_calls or []
+
+        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
+        if tool_calls:
+            assistant_msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        if not tool_calls:
+            return msg.content or ""
+
+        for tc in tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+            result = execute_tool(tc.function.name, args, workspace)
+            log.info("[%s] tool %s(%.60s) → %d симв.",
+                     agent.id, tc.function.name, str(args), len(result))
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    # Исчерпали лимит итераций — просим финальный ответ уже без инструментов.
+    resp = client.chat.completions.create(model=model, messages=messages, max_tokens=4096)
+    return resp.choices[0].message.content or ""
+
+
+def _build_agent_system(agent: AgentState, extra_context: str = "",
+                        workspace: Optional[str] = None) -> str:
+    """Собирает system prompt: soul + skill + (инструменты) + формат вывода."""
     parts = [
         agent.soul.to_prompt(),
         agent.skill.to_prompt(),
     ]
     if extra_context:
         parts.append(f"Дополнительный контекст: {extra_context}")
+    if workspace:
+        parts.append(
+            "У тебя есть ИНСТРУМЕНТЫ — вызывай их, а не описывай словами:\n"
+            "  • http_fetch(url) — скачать реальные данные из интернета;\n"
+            "  • write_file(path, content), read_file(path), list_files() —\n"
+            f"    файлы в твоём рабочем каталоге проекта: {workspace}\n"
+            "Делай задачу ПО-НАСТОЯЩЕМУ: если нужны данные/структура страницы — "
+            "СКАЧАЙ через http_fetch (не выдумывай). Если нужен код/конфиги/Docker — "
+            "СОЗДАЙ реальные файлы через write_file. В финальном 'result' кратко "
+            "опиши, что сделал, и перечисли созданные файлы (через list_files)."
+        )
     parts.append(
-        "Ответь JSON-объектом с ключами:\n"
+        "Когда задача выполнена, ответь JSON-объектом с ключами:\n"
         '  "result"  — твой основной вывод (строка)\n'
         '  "notes"   — краткие заметки по подходу (строка, необязательно)\n'
         '  "learned" — одно предложение о том, что ты узнал или новый паттерн (строка, необязательно)\n'

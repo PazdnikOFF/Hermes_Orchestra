@@ -68,6 +68,13 @@ class OrchestraConfig:
     embedding_model: str = "text-embedding-3-small"
     use_embeddings: bool = False  # включить → SoulRegistry scoring через cosine
 
+    # ── Инструменты агентов (итерация 8): сеть + файлы, без shell ─────────
+    # Агент через function-calling Grok'а реально фетчит URL и пишет файлы
+    # проекта в изолированный workspace. Выключить → ORCHESTRA_AGENT_TOOLS=0.
+    enable_agent_tools: bool = True
+    agent_workspace_dir: str = "~/.hermes/orchestra_workspaces"
+    agent_tool_max_iters: int = 12   # макс. циклов tool-call на один вызов агента
+
     # ── Пути ──────────────────────────────────────────────────────────────
     # Корень пакета (папка, в которой лежит modules/)
     package_root: Path = field(default_factory=lambda: Path(__file__).parent.parent)
@@ -127,6 +134,10 @@ def load_config() -> OrchestraConfig:
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
         embedding_model=env_or("ORCHESTRA_EMBEDDING_MODEL", defaults.embedding_model),
         use_embeddings=os.environ.get("ORCHESTRA_USE_EMBEDDINGS", "0") == "1",
+        enable_agent_tools=os.environ.get("ORCHESTRA_AGENT_TOOLS", "1") == "1",
+        agent_workspace_dir=env_or("ORCHESTRA_WORKSPACE_DIR", defaults.agent_workspace_dir),
+        agent_tool_max_iters=int(os.environ.get("ORCHESTRA_AGENT_TOOL_ITERS",
+                                                str(defaults.agent_tool_max_iters))),
         slow_threshold=float(os.environ.get("ORCHESTRA_SLOW_THRESHOLD", str(defaults.slow_threshold))),
         idle_ttl=int(os.environ.get("ORCHESTRA_IDLE_TTL", str(defaults.idle_ttl))),
         max_clones=int(os.environ.get("ORCHESTRA_MAX_CLONES", str(defaults.max_clones))),

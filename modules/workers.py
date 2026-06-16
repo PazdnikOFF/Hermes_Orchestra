@@ -691,7 +691,11 @@ class AgentWorker(BaseWorker):
                 "Учти эту критику и выдай улучшенный результат."
             )
 
-        raw    = agent_call(agent, task.content, extra_context=extra)
+        # workspace общий на корневую задачу — researcher/analyst/coder строят
+        # один проект и видят файлы друг друга (вместе с DAG-пробросом контекста).
+        workspace_id = task.parent_task_id or task.id
+        raw    = agent_call(agent, task.content, extra_context=extra,
+                            workspace_id=workspace_id)
         parsed = parse_agent_output(raw)
         result = parsed.get("result", raw)
         learned = parsed.get("learned")
