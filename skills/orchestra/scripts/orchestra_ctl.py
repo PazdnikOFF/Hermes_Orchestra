@@ -249,9 +249,11 @@ def cmd_stop(args):
         from modules.workers import DYNAMIC_PIDS_KEY
         r = get_redis()
         r.delete(DYNAMIC_PIDS_KEY)
-        # Чистим worker-локи чтобы следующий start корректно подхватил
-        for key in r.scan_iter(match="worker:running:*", count=200):
-            r.delete(key)
+        r.delete("orchestra:dir_refcount")
+        # Чистим lifecycle/worker-ключи чтобы следующий start с нуля
+        for pat in ("worker:running:*", "worker:pid:*", "dir_acquired:*"):
+            for key in r.scan_iter(match=pat, count=200):
+                r.delete(key)
     except Exception:
         pass
 
@@ -961,6 +963,157 @@ def cmd_tasks_by_date(args):
               f"{(r_['score'] or '-'):6s} {r_['original']}")
 
 
+def cmd_diag(args):
+    """Полная диагностика одной задачи: статус, decomp, notify, history."""
+    from modules.redis_bus import get_redis
+    r = get_redis()
+    tid = args.task_id
+
+    print(f"=== Диагностика {tid} ===\n")
+
+    # 1. Корневой results
+    data = r.hgetall(f"results:{tid}")
+    if not data:
+        print(f"✗ Ключ results:{tid} НЕ найден.")
+        print("  Возможно задача никогда не доходила до Senior — Hermes-агент")
+        print("  не вызвал orchestra_submit, либо передал другой task_id.")
+        return
+
+    print("results:%s:" % tid)
+    for k in ("status", "score", "attempts", "gap_count", "assembled_at",
+              "last_error", "original_task"):
+        v = data.get(k, "")
+        if v:
+            print(f"  {k:18s} = {v[:120]}")
+    if "final_result" in data:
+        print(f"  final_result       = <len={len(data['final_result'])}> "
+              f"{data['final_result'][:100]}…")
+    else:
+        print(f"  final_result       = (отсутствует)")
+
+    # 2. Notify подписка
+    print("\nNotification:")
+    notify_target = r.get(f"notify:{tid}")
+    sent_at = r.get(f"notify_sent:{tid}")
+    if notify_target:
+        print(f"  ✓ Подписка: target={notify_target}")
+    else:
+        print(f"  ✗ Подписки нет (notify:{tid} отсутствует) — push не уйдёт.")
+        print(f"    Можно зарегистрировать сейчас:")
+        print(f"      orchestra_ctl notify-now {tid} tg:<твой_chat_id>")
+    if sent_at:
+        print(f"  ✓ Уже отправлено: {sent_at}")
+
+    # 3. Декомпозиция
+    decomp_raw = data.get("decomposition")
+    if decomp_raw:
+        print("\nDecomposition:")
+        try:
+            decomp = json.loads(decomp_raw)
+            for direction, ids in decomp.items():
+                print(f"  {direction}:")
+                for sid in ids:
+                    sub = r.hgetall(f"results:{sid}")
+                    st = sub.get("status", "(пусто)")
+                    sc = sub.get("score", "")
+                    at = sub.get("attempts", "")
+                    err = sub.get("last_error", "")[:60]
+                    line = f"    · {sid}  {st}"
+                    if sc:  line += f"  score={sc}"
+                    if at:  line += f"  attempts={at}"
+                    if err: line += f"  err={err}"
+                    print(line)
+        except json.JSONDecodeError:
+            print(f"  (невалидный JSON: {decomp_raw[:200]})")
+    else:
+        print("\nDecomposition: (отсутствует — Senior не декомпозировал)")
+
+    # 4. Refcount/аренда направлений
+    acquired = r.smembers(f"dir_acquired:{tid}")
+    if acquired:
+        print(f"\nDirections held by this task: {', '.join(sorted(acquired))}")
+    else:
+        print("\nDirections held: (нет — либо teardown прошёл, либо acquire не сработал)")
+
+    # 5. Worker-процессы по direction'ам этой задачи
+    if decomp_raw:
+        try:
+            decomp = json.loads(decomp_raw)
+            print("\nLive workers per direction:")
+            for direction in decomp:
+                live = []
+                for kind in ("middle", "junior", "agent"):
+                    lock = r.get(f"worker:running:{kind}:{direction}")
+                    pid = r.get(f"worker:pid:{kind}:{direction}")
+                    if lock or pid:
+                        is_alive = _pid_alive(int(pid)) if pid and pid.isdigit() else False
+                        live.append(f"{kind}={'✓' if is_alive else '✗'}({pid or '-'})")
+                print(f"  {direction:14s}  {' '.join(live) or '(нет)'}")
+        except Exception:
+            pass
+
+    print()
+
+
+def cmd_notify_now(args):
+    """Зарегистрировать push-уведомление вручную для уже отправленной задачи.
+
+    Полезно когда Hermes-агент не передал notify_target при submit,
+    а тебе всё равно хочется получить результат в TG.
+    """
+    from modules.notifier import register_notification
+    register_notification(args.task_id, args.target)
+    print(f"Подписка для {args.task_id} → {args.target} создана.")
+    print("NotifierWorker подхватит на следующем тике (≤ 3 сек).")
+
+
+def cmd_lifecycle(args):
+    """Что сейчас 'арендовано' и какие subprocess'ы живы."""
+    from modules.redis_bus import get_redis
+    r = get_redis()
+
+    refs = r.hgetall("orchestra:dir_refcount")
+    print("Refcount по направлениям:")
+    if not refs:
+        print("  (пусто — нет активных задач, удерживающих direction'ы)")
+    else:
+        for d, n in sorted(refs.items()):
+            print(f"  {d:14s}  {n}")
+
+    print("\nЖивые worker subprocess'ы:")
+    pids = {}
+    for key in r.scan_iter(match="worker:pid:*", count=200):
+        parts = key.split(":")
+        if len(parts) < 4:
+            continue
+        kind, direction = parts[2], parts[3]
+        pid = r.get(key)
+        try:
+            pid_i = int(pid)
+            alive = _pid_alive(pid_i)
+        except (TypeError, ValueError):
+            pid_i, alive = 0, False
+        pids.setdefault(direction, []).append((kind, pid_i, alive))
+    if not pids:
+        print("  (пусто)")
+    else:
+        for d, items in sorted(pids.items()):
+            for kind, pid, alive in sorted(items):
+                marker = "✓" if alive else "✗"
+                print(f"  {marker} {kind:7s} {d:14s} pid={pid}")
+
+    print("\nАрендованные direction'ы по задачам:")
+    found = False
+    for key in r.scan_iter(match="dir_acquired:*", count=200):
+        tid = key.split(":", 1)[1]
+        dirs = r.smembers(key)
+        if dirs:
+            found = True
+            print(f"  {tid}  →  {', '.join(sorted(dirs))}")
+    if not found:
+        print("  (нет активных аренд)")
+
+
 def cmd_health(args):
     """Проверить что всё необходимое для работы оркестра доступно.
 
@@ -1240,6 +1393,15 @@ def main():
 
     sub.add_parser("config", help="Показать эффективную конфигурацию (после env-override)")
     sub.add_parser("health-check", help="Проверить Redis + Hermes-proxy + SOULs/")
+    sub.add_parser("lifecycle",    help="Текущий refcount direction'ов + живые worker PIDs")
+
+    pd = sub.add_parser("diag", help="Полная диагностика задачи (status/decomp/notify/workers)")
+    pd.add_argument("task_id")
+
+    pn = sub.add_parser("notify-now",
+                        help="Зарегистрировать push для уже отправленной задачи")
+    pn.add_argument("task_id")
+    pn.add_argument("target", help="tg:<chat_id> | slack:<channel> | webhook:<url> | log:")
 
     pa = sub.add_parser("ask", help="End-to-end: submit + stream прогресса + финал")
     pa.add_argument("task", help="Текст задачи")
@@ -1289,6 +1451,9 @@ def main():
         "judge-history": cmd_judge_history,
         "config":        cmd_config,
         "health-check":  cmd_health,
+        "lifecycle":     cmd_lifecycle,
+        "diag":          cmd_diag,
+        "notify-now":    cmd_notify_now,
         "ask":           cmd_ask,
         "wait":          cmd_wait,
         "tasks-active":  cmd_tasks_active,
