@@ -40,7 +40,11 @@ cp "$SCRIPT_DIR/ARCHITECTURE.md" "$SKILL_DST/"
 
 # 5. Установить tool plugin
 echo "Установка tool → $HERMES_REPO/tools/orchestra_tool.py"
+mkdir -p "$HERMES_REPO/tools"
 cp "$SCRIPT_DIR/tools/orchestra_tool.py" "$HERMES_REPO/tools/orchestra_tool.py"
+# Опциональный TG-бот
+[[ -f "$SCRIPT_DIR/tools/orchestra_tgbot.py" ]] \
+    && cp "$SCRIPT_DIR/tools/orchestra_tgbot.py" "$HERMES_REPO/tools/orchestra_tgbot.py"
 
 # Патч пути в tool plugin
 SKILL_ABS="$SKILL_DST"
@@ -72,7 +76,7 @@ if [[ -f "$TOOLSETS" ]] && ! grep -q "orchestra_submit" "$TOOLSETS"; then
 _ORCHESTRA_TOOLS = [
     "orchestra_submit", "orchestra_status", "orchestra_result",
     "orchestra_agents", "orchestra_metrics", "orchestra_agent_info",
-    "orchestra_add_agent",
+    "orchestra_add_agent", "orchestra_tasks_active", "orchestra_tasks_by_date",
 ]
 EOF
     echo "Orchestra toolset добавлен в toolsets.py"

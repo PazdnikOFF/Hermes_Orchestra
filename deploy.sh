@@ -45,9 +45,16 @@ cp -r "$SCRIPT_DIR/modules/." "$ORCHESTRA_DIR/modules/"
 cp -r "$SCRIPT_DIR/SOULs"     "$ORCHESTRA_DIR/" 2>/dev/null || true
 cp    "$SCRIPT_DIR/skills/orchestra/SKILL.md"            "$ORCHESTRA_DIR/"
 cp    "$SCRIPT_DIR/skills/orchestra/scripts/orchestra_ctl.py" "$ORCHESTRA_DIR/scripts/"
-cp    "$SCRIPT_DIR/tools/orchestra_tool.py" "$HERMES/tools/" 2>/dev/null || true
+# Hermes-тул: КРИТИЧНО для регистрации orchestra_submit/tasks_active/... .
+# Копируем громко (без `|| true`) — set -e оборвёт деплой, если не удалось,
+# чтобы тихий сбой не оставлял инструменты Hermes незарегистрированными.
+mkdir -p "$HERMES/tools"
+cp    "$SCRIPT_DIR/tools/orchestra_tool.py" "$HERMES/tools/orchestra_tool.py"
+# orchestra_tgbot.py — опционален (TG-бот). Копируем если присутствует.
+[[ -f "$SCRIPT_DIR/tools/orchestra_tgbot.py" ]] \
+    && cp "$SCRIPT_DIR/tools/orchestra_tgbot.py" "$HERMES/tools/orchestra_tgbot.py"
 cp    "$SCRIPT_DIR/ARCHITECTURE.md" "$ORCHESTRA_DIR/" 2>/dev/null || true
-echo "    OK"
+echo "    OK (tool → $HERMES/tools/orchestra_tool.py)"
 
 # 3. Env-файл если нет
 if [[ ! -f "$ENV_FILE" ]]; then
