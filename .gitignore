@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+.DS_Store
+# секреты/раннтайм Hermes — НЕ коммитим
+*.env
+.hermes/
